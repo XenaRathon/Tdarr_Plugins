@@ -4,6 +4,21 @@
 
 # Tdarr_Plugins
 
+> ## 🛠️ Fork notice — `XenaRathon/Tdarr_Plugins`
+> A personalized fork of the official **[HaveAGitGat/Tdarr_Plugins](https://github.com/HaveAGitGat/Tdarr_Plugins)**
+> that bundles **empaa's AV1 flow plugins** — `abAv1Encode`, `av1anEncode`, `crfSearchEncode`,
+> `sanitizeFile`, `arrRename` — alongside the official community plugins, so one plugin source covers
+> both. Kept in sync with **both** upstreams (official `HaveAGitGat/Tdarr_Plugins` + `empaa/tdarr-plugins`).
+>
+> - **How to point Tdarr at this fork & sync from upstream:** see the **[Wiki](../../wiki)**.
+> - **Built with Claude:** the upstream-sync work and these notes were prepared with the help of
+>   **Claude (Anthropic, Claude Opus 4.8)**. Contributors: [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
+> - **License:** official Tdarr_Plugins content keeps its upstream license; this fork's own additions are GPL-3.0.
+>
+> *The official upstream README follows.*
+
+---
+
 Visit the docs for more info:
 https://docs.tdarr.io/docs/plugins/basics
 
