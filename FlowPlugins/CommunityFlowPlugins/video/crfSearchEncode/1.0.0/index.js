@@ -939,6 +939,30 @@ var details = () => ({
       defaultValue: "true",
       inputUI: { type: "switch" },
       tooltip: "If the source has HDR10+, extract it to a .hdr10plus.json sidecar beside the source. Per-frame dynamic metadata is NOT injected into the chunked AV1 here (av1an scene-chunking misaligns it); sidecars are archival/re-injectable. HDR10 static colour/PQ IS applied per-chunk. HDR10+ post-encode AV1 inject is a planned image follow-up."
+    },
+    {
+      label: "av1an Workers",
+      name: "workers",
+      type: "number",
+      defaultValue: "0",
+      inputUI: { type: "text" },
+      tooltip: "Number of parallel av1an chunk workers. 0 = av1an default. On the 7700X (8c/16t), 4 workers x ~4 threads is a good throughput balance."
+    },
+    {
+      label: "Film Grain Synthesis",
+      name: "film_grain",
+      type: "number",
+      defaultValue: "0",
+      inputUI: { type: "text" },
+      tooltip: "SVT-AV1 --film-grain level (0 = off, ~8-15 for grainy film). Denoises then re-synthesizes grain at decode \u2014 big bitrate savings on grainy content while preserving the look. Applied to search + encode."
+    },
+    {
+      label: "Verify Output",
+      name: "verify_output",
+      type: "boolean",
+      defaultValue: "true",
+      inputUI: { type: "switch" },
+      tooltip: "After encoding, ffprobe the output and confirm its duration matches the source (within ~2%) before passing success. Guards a corrupt/truncated encode from replacing a good source."
     }
   ],
   outputs: [
@@ -976,6 +1000,9 @@ var plugin = async (args) => {
   const customSvtParams = String(inputs.custom_svt_params || "").trim();
   const dvRpuSidecar = inputs.dv_rpu_sidecar === void 0 ? true : inputs.dv_rpu_sidecar === true || inputs.dv_rpu_sidecar === "true";
   const hdr10plusSidecar = inputs.hdr10plus_sidecar === void 0 ? true : inputs.hdr10plus_sidecar === true || inputs.hdr10plus_sidecar === "true";
+  const workers = Number(inputs.workers) || 0;
+  const filmGrain = Number(inputs.film_grain) || 0;
+  const verifyOutput = inputs.verify_output === void 0 ? true : inputs.verify_output === true || inputs.verify_output === "true";
   const findBin = (name, ...paths) => paths.find((p) => fs.existsSync(p)) || (() => {
     throw new Error(`Required binary not found: ${name} (checked ${paths.join(", ")})`);
   })();
@@ -1060,8 +1087,9 @@ var plugin = async (args) => {
       }
     }
   }
-  const finalExtraSvt = customSvtParams;
-  const searchExtraSvt = customSvtParams ? customSvtParams.replace(/--(\S+)\s+(\S+)/g, "--svt $1=$2") : "";
+  const grainSvt = filmGrain > 0 ? `--film-grain ${filmGrain}` : "";
+  const finalExtraSvt = [customSvtParams, grainSvt].filter(Boolean).join(" ");
+  const searchExtraSvt = finalExtraSvt ? finalExtraSvt.replace(/--(\S+)\s+(\S+)/g, "--svt $1=$2") : "";
   const lwiCache = path.join(vsDir, "source.lwi");
   const vpyScript = path.join(vsDir, "source.vpy");
   const escPy = (s) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -1267,6 +1295,7 @@ var plugin = async (args) => {
   if (doDownscale) {
     av1anArgs.push(...buildAv1anVmafResArgs(downscaleRes));
   }
+  if (workers > 0) av1anArgs.push("--workers", String(workers));
   av1anArgs.push("-v", encFlags);
   jobLog(`[phase 2] av1an ${av1anArgs.map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ")}`);
   let sizeExceeded = false;
@@ -1333,6 +1362,37 @@ var plugin = async (args) => {
   }
   if (!encodeOk) {
     throw new Error("av1an encode failed -- check logs for details");
+  }
+  if (verifyOutput) {
+    const cp = require("child_process");
+    const ffprobeBin = BIN.ffmpeg.replace(/ffmpeg$/, "ffprobe");
+    const probeDur = (p) => {
+      try {
+        return parseFloat(cp.execFileSync(
+          ffprobeBin,
+          ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", p],
+          { encoding: "utf8", timeout: 6e4 }
+        ).trim()) || 0;
+      } catch (_) {
+        return 0;
+      }
+    };
+    const srcDur = parseFloat(file.ffProbeData && file.ffProbeData.format && file.ffProbeData.format.duration || 0) || probeDur(inputPath);
+    const outDur = probeDur(outputPath);
+    if (srcDur > 0 && outDur > 0) {
+      const diff = Math.abs(outDur - srcDur) / srcDur;
+      if (diff > 0.02) {
+        jobLog(`[verify] FAIL: output ${outDur.toFixed(1)}s vs source ${srcDur.toFixed(1)}s (${(diff * 100).toFixed(1)}% off) -- NOT replacing source`);
+        try {
+          fs.rmSync(searchDir, { recursive: true, force: true });
+        } catch (_) {
+        }
+        return { outputFileObj: args.inputFileObj, outputNumber: 2, variables: args.variables };
+      }
+      jobLog(`[verify] OK: output duration ${outDur.toFixed(1)}s matches source (${(diff * 100).toFixed(2)}% diff)`);
+    } else {
+      jobLog("[verify] could not read durations -- skipping check");
+    }
   }
   const inBytes = (() => {
     try {

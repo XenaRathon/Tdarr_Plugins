@@ -235,9 +235,9 @@ var details = () => ({
       label: "Bitrate by Channels (kbps)",
       name: "bitrate_map",
       type: "string",
-      defaultValue: "1=64,2=128,6=256,8=320",
+      defaultValue: "1=48,2=96,3=144,6=288,8=384",
       inputUI: { type: "text" },
-      tooltip: `channels=kbps pairs used to pick each track's Opus bitrate from its channel count, e.g. "1=64,2=128,6=256,8=320" (6=5.1, 8=7.1). Channel counts not listed use Per-Channel Fallback.`
+      tooltip: `channels=kbps pairs used to pick each track's Opus bitrate from its channel count, e.g. "1=48,2=96,3=144,6=288,8=384" (6=5.1, 8=7.1). Channel counts not listed use Per-Channel Fallback.`
     },
     {
       label: "Per-Channel Fallback (kbps)",
@@ -267,7 +267,7 @@ var plugin = async (args) => {
   const { createProcessManager } = require_processManager();
   const { createLogger } = require_logger();
   const inputs = args.inputs || {};
-  const map = parseBitrateMap(inputs.bitrate_map || "1=64,2=128,6=256,8=320");
+  const map = parseBitrateMap(inputs.bitrate_map || "1=48,2=96,3=144,6=288,8=384");
   const perCh = Number(inputs.per_channel_kbps) || 48;
   const skipIfOpus = inputs.skip_if_opus === void 0 ? true : inputs.skip_if_opus === true || inputs.skip_if_opus === "true";
   const { jobLog, dbg } = createLogger(args.jobLog, args.workDir);
