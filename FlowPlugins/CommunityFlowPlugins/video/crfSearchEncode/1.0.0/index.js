@@ -1047,6 +1047,7 @@ var plugin = async (args) => {
   fs.mkdirSync(vsDir, { recursive: true });
   fs.mkdirSync(av1anTemp, { recursive: true });
   fs.mkdirSync(searchDir, { recursive: true });
+  process.env.XDG_CACHE_HOME = searchDir;
   const isHdrSvt = encoder !== "aom" && !!hdrSvt;
   const srcHasDv = (stream.side_data_list || []).some((d) => /dovi|dolby vision/i.test(d.side_data_type || ""));
   if (isHdrSvt && dvRpuSidecar && srcHasDv) {
