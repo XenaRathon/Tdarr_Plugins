@@ -933,20 +933,12 @@ var details = () => ({
       tooltip: "If the source has Dolby Vision, extract its RPU to a .dvrpu.bin sidecar beside the source (fallback/archival, re-injectable later). Needs dovi_tool in the image."
     },
     {
-      label: "Inject Dolby Vision into AV1",
-      name: "dv_rpu_inject",
-      type: "boolean",
-      defaultValue: "false",
-      inputUI: { type: "switch" },
-      tooltip: "Inject the DV RPU into the AV1 output (Profile 10.1). OFF by default: AV1 DV is embed-only and not yet readable by common tooling or most players. Enable when support matures."
-    },
-    {
-      label: "Inject HDR10+ into AV1",
-      name: "hdr10plus_inject",
+      label: "Keep HDR10+ Sidecar",
+      name: "hdr10plus_sidecar",
       type: "boolean",
       defaultValue: "true",
       inputUI: { type: "switch" },
-      tooltip: "If the source has HDR10+ dynamic metadata, carry it into the AV1 output. Needs hdr10plus_tool in the image."
+      tooltip: "If the source has HDR10+, extract it to a .hdr10plus.json sidecar beside the source. Per-frame dynamic metadata is NOT injected into the chunked AV1 here (av1an scene-chunking misaligns it); sidecars are archival/re-injectable. HDR10 static colour/PQ IS applied per-chunk. HDR10+ post-encode AV1 inject is a planned image follow-up."
     }
   ],
   outputs: [
@@ -983,8 +975,7 @@ var plugin = async (args) => {
   const vmafStep = Number(inputs.vmaf_step) || 1;
   const customSvtParams = String(inputs.custom_svt_params || "").trim();
   const dvRpuSidecar = inputs.dv_rpu_sidecar === void 0 ? true : inputs.dv_rpu_sidecar === true || inputs.dv_rpu_sidecar === "true";
-  const dvRpuInject = inputs.dv_rpu_inject === true || inputs.dv_rpu_inject === "true";
-  const hdr10plusInject = inputs.hdr10plus_inject === void 0 ? true : inputs.hdr10plus_inject === true || inputs.hdr10plus_inject === "true";
+  const hdr10plusSidecar = inputs.hdr10plus_sidecar === void 0 ? true : inputs.hdr10plus_sidecar === true || inputs.hdr10plus_sidecar === "true";
   const findBin = (name, ...paths) => paths.find((p) => fs.existsSync(p)) || (() => {
     throw new Error(`Required binary not found: ${name} (checked ${paths.join(", ")})`);
   })();
@@ -1029,68 +1020,47 @@ var plugin = async (args) => {
   fs.mkdirSync(vsDir, { recursive: true });
   fs.mkdirSync(av1anTemp, { recursive: true });
   fs.mkdirSync(searchDir, { recursive: true });
-  let dvRpuPath = "";
-  let hdr10plusPath = "";
   const isHdrSvt = encoder !== "aom" && !!hdrSvt;
   const srcHasDv = (stream.side_data_list || []).some((d) => /dovi|dolby vision/i.test(d.side_data_type || ""));
-  if (isHdrSvt && (dvRpuSidecar || dvRpuInject)) {
+  if (isHdrSvt && dvRpuSidecar && srcHasDv) {
     if (!DOVI_TOOL) {
-      jobLog("[dv] dovi_tool not present in image -- skipping Dolby Vision");
-    } else if (!srcHasDv) {
-      dbg("[dv] source has no Dolby Vision RPU -- skipping");
+      jobLog("[dv] dovi_tool not present in image -- skipping DV sidecar");
     } else {
       const sidecar = inputPath.replace(/\.[^./]+$/, "") + ".dvrpu.bin";
-      const workRpu = path.join(workBase, "source.dvrpu.bin");
-      let rpu = fs.existsSync(sidecar) && fs.statSync(sidecar).size > 0 ? sidecar : "";
-      if (rpu) {
-        jobLog(`[dv] using existing RPU sidecar: ${sidecar}`);
+      if (fs.existsSync(sidecar) && fs.statSync(sidecar).size > 0) {
+        jobLog(`[dv] DV RPU sidecar already present: ${sidecar}`);
       } else {
-        jobLog("[dv] extracting Dolby Vision RPU from source...");
-        const ex = await pm.spawnAsync(DOVI_TOOL, ["extract-rpu", "-i", inputPath, "-o", workRpu], { cwd: workBase, silent: true });
-        if (ex === 0 && fs.existsSync(workRpu) && fs.statSync(workRpu).size > 0) {
-          rpu = workRpu;
-          if (dvRpuSidecar) {
-            try {
-              fs.copyFileSync(workRpu, sidecar);
-              jobLog(`[dv] RPU sidecar saved beside source: ${sidecar}`);
-            } catch (e) {
-              jobLog(`[dv] could not write sidecar (${e.message})`);
-            }
+        jobLog("[dv] extracting Dolby Vision RPU sidecar from source...");
+        const ex = await pm.spawnAsync(DOVI_TOOL, ["extract-rpu", "-i", inputPath, "-o", sidecar], { cwd: workBase, silent: true });
+        if (ex === 0 && fs.existsSync(sidecar) && fs.statSync(sidecar).size > 0) jobLog(`[dv] DV RPU sidecar saved: ${sidecar}`);
+        else {
+          jobLog("[dv] DV RPU extraction failed");
+          try {
+            fs.unlinkSync(sidecar);
+          } catch (_) {
           }
-        } else {
-          jobLog("[dv] RPU extraction failed -- continuing without DV");
         }
       }
-      if (rpu && dvRpuInject) {
-        dvRpuPath = rpu;
-        jobLog("[dv] DV RPU will be injected into the AV1 output (Profile 10.1)");
-      } else if (rpu) jobLog("[dv] DV RPU kept as sidecar only (AV1 injection disabled)");
     }
   }
-  if (isHdrSvt && hdr10plusInject) {
-    if (!HDR10PLUS_TOOL) {
-      jobLog("[hdr10+] hdr10plus_tool not present in image -- skipping HDR10+");
+  if (isHdrSvt && hdr10plusSidecar && HDR10PLUS_TOOL) {
+    const sidecar = inputPath.replace(/\.[^./]+$/, "") + ".hdr10plus.json";
+    if (fs.existsSync(sidecar) && fs.statSync(sidecar).size > 2) {
+      jobLog(`[hdr10+] HDR10+ sidecar already present: ${sidecar}`);
     } else {
-      const workJson = path.join(workBase, "source.hdr10plus.json");
       jobLog("[hdr10+] checking source for HDR10+ metadata...");
-      const ex = await pm.spawnAsync(HDR10PLUS_TOOL, ["extract", "-i", inputPath, "-o", workJson], { cwd: workBase, silent: true });
-      if (ex === 0 && fs.existsSync(workJson) && fs.statSync(workJson).size > 2) {
-        hdr10plusPath = workJson;
-        jobLog("[hdr10+] HDR10+ metadata found -- will inject into the AV1 output");
-      } else {
-        dbg("[hdr10+] no HDR10+ metadata (or extraction failed) -- skipping");
+      const ex = await pm.spawnAsync(HDR10PLUS_TOOL, ["extract", "-i", inputPath, "-o", sidecar], { cwd: workBase, silent: true });
+      if (ex === 0 && fs.existsSync(sidecar) && fs.statSync(sidecar).size > 2) jobLog(`[hdr10+] HDR10+ sidecar saved: ${sidecar}`);
+      else {
+        dbg("[hdr10+] no HDR10+ metadata -- skipping");
         try {
-          fs.unlinkSync(workJson);
+          fs.unlinkSync(sidecar);
         } catch (_) {
         }
       }
     }
   }
-  const finalExtraSvt = [
-    dvRpuPath ? `--dolby-vision-rpu ${dvRpuPath}` : "",
-    hdr10plusPath ? `--hdr10plus-json ${hdr10plusPath}` : "",
-    customSvtParams
-  ].filter(Boolean).join(" ");
+  const finalExtraSvt = customSvtParams;
   const searchExtraSvt = customSvtParams ? customSvtParams.replace(/--(\S+)\s+(\S+)/g, "--svt $1=$2") : "";
   const lwiCache = path.join(vsDir, "source.lwi");
   const vpyScript = path.join(vsDir, "source.vpy");

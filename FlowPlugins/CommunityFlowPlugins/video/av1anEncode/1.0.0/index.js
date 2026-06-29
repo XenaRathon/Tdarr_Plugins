@@ -891,6 +891,30 @@ var details = () => ({
       defaultValue: "1080p",
       inputUI: { type: "dropdown", options: ["720p", "1080p", "1440p"] },
       tooltip: "Target resolution for downscaling. Only used when downscale is enabled."
+    },
+    {
+      label: "Custom SVT-AV1 Params",
+      name: "custom_svt_params",
+      type: "string",
+      defaultValue: "",
+      inputUI: { type: "text" },
+      tooltip: "Extra SVT-AV1 (Tritium) params in av1an form, e.g. '--ac-bias 1.0 --variance-boost-curve 3 --tune 0'. Applied to the encode (and av1an's target-quality probes)."
+    },
+    {
+      label: "Keep Dolby Vision RPU Sidecar",
+      name: "dv_rpu_sidecar",
+      type: "boolean",
+      defaultValue: "true",
+      inputUI: { type: "switch" },
+      tooltip: "If the source has Dolby Vision, extract its RPU to a .dvrpu.bin sidecar beside the source (archival/re-injectable). Not injected into the chunked AV1 (av1an chunking misaligns per-frame metadata). Needs dovi_tool."
+    },
+    {
+      label: "Keep HDR10+ Sidecar",
+      name: "hdr10plus_sidecar",
+      type: "boolean",
+      defaultValue: "true",
+      inputUI: { type: "switch" },
+      tooltip: "If the source has HDR10+, extract it to a .hdr10plus.json sidecar beside the source. HDR10 static colour/PQ is applied per-chunk; per-frame dynamic metadata is sidecar-only here. Needs hdr10plus_tool."
     }
   ],
   outputs: [
@@ -915,6 +939,9 @@ var plugin = async (args) => {
   const maxEncodedPercent = Number(inputs.max_encoded_percent) || 80;
   const downscaleEnabled = inputs.downscale_enabled === true || inputs.downscale_enabled === "true";
   const downscaleRes = String(inputs.downscale_resolution || "1080p");
+  const customSvtParams = String(inputs.custom_svt_params || "").trim();
+  const dvRpuSidecar = inputs.dv_rpu_sidecar === void 0 ? true : inputs.dv_rpu_sidecar === true || inputs.dv_rpu_sidecar === "true";
+  const hdr10plusSidecar = inputs.hdr10plus_sidecar === void 0 ? true : inputs.hdr10plus_sidecar === true || inputs.hdr10plus_sidecar === "true";
   const findBin = (name, ...paths) => paths.find((p) => fs.existsSync(p)) || (() => {
     throw new Error(`Required binary not found: ${name} (checked ${paths.join(", ")})`);
   })();
@@ -924,6 +951,9 @@ var plugin = async (args) => {
     vspipe: findBin("vspipe", "/usr/local/bin/vspipe", "/usr/bin/vspipe"),
     mkvmerge: findBin("mkvmerge", "/usr/local/bin/mkvmerge", "/usr/bin/mkvmerge")
   };
+  const optBin = (...paths) => paths.find((p) => fs.existsSync(p)) || null;
+  const DOVI_TOOL = optBin("/usr/local/bin/dovi_tool", "/usr/bin/dovi_tool");
+  const HDR10PLUS_TOOL = optBin("/usr/local/bin/hdr10plus_tool", "/usr/bin/hdr10plus_tool");
   const vmafModel = "/usr/local/share/vmaf/vmaf_v0.6.1.json";
   if (!fs.existsSync(vmafModel)) throw new Error(`VMAF model not found: ${vmafModel}`);
   const { jobLog, dbg } = createLogger(args.jobLog, args.workDir);
@@ -954,7 +984,43 @@ var plugin = async (args) => {
   fs.mkdirSync(vsDir, { recursive: true });
   fs.mkdirSync(av1anTemp, { recursive: true });
   const lwiCache = path.join(vsDir, "source.lwi");
-  const encFlags = encoder === "aom" ? buildAomFlags(encPreset, hdrAom) : buildSvtFlags(encPreset, hdrSvt);
+  const isHdrSvt = encoder !== "aom" && !!hdrSvt;
+  const srcHasDv = (stream.side_data_list || []).some((d) => /dovi|dolby vision/i.test(d.side_data_type || ""));
+  if (isHdrSvt && dvRpuSidecar && srcHasDv && DOVI_TOOL) {
+    const sidecar = inputPath.replace(/\.[^./]+$/, "") + ".dvrpu.bin";
+    if (fs.existsSync(sidecar) && fs.statSync(sidecar).size > 0) {
+      jobLog(`[dv] DV RPU sidecar already present: ${sidecar}`);
+    } else {
+      jobLog("[dv] extracting Dolby Vision RPU sidecar from source...");
+      const ex = await pm.spawnAsync(DOVI_TOOL, ["extract-rpu", "-i", inputPath, "-o", sidecar], { cwd: workBase, silent: true });
+      if (ex === 0 && fs.existsSync(sidecar) && fs.statSync(sidecar).size > 0) jobLog(`[dv] DV RPU sidecar saved: ${sidecar}`);
+      else {
+        jobLog("[dv] DV RPU extraction failed");
+        try {
+          fs.unlinkSync(sidecar);
+        } catch (_) {
+        }
+      }
+    }
+  }
+  if (isHdrSvt && hdr10plusSidecar && HDR10PLUS_TOOL) {
+    const sidecar = inputPath.replace(/\.[^./]+$/, "") + ".hdr10plus.json";
+    if (fs.existsSync(sidecar) && fs.statSync(sidecar).size > 2) {
+      jobLog(`[hdr10+] HDR10+ sidecar already present: ${sidecar}`);
+    } else {
+      jobLog("[hdr10+] checking source for HDR10+ metadata...");
+      const ex = await pm.spawnAsync(HDR10PLUS_TOOL, ["extract", "-i", inputPath, "-o", sidecar], { cwd: workBase, silent: true });
+      if (ex === 0 && fs.existsSync(sidecar) && fs.statSync(sidecar).size > 2) jobLog(`[hdr10+] HDR10+ sidecar saved: ${sidecar}`);
+      else {
+        dbg("[hdr10+] no HDR10+ metadata -- skipping");
+        try {
+          fs.unlinkSync(sidecar);
+        } catch (_) {
+        }
+      }
+    }
+  }
+  const encFlags = encoder === "aom" ? buildAomFlags(encPreset, hdrAom) : buildSvtFlags(encPreset, hdrSvt, customSvtParams);
   jobLog("=".repeat(64));
   jobLog(`AV1AN ENCODE  encoder=${encoder}  preset=${encPreset}`);
   jobLog(`  input      : ${inputPath}`);
