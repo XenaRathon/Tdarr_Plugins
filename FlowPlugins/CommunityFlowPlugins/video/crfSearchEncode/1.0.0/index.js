@@ -326,12 +326,12 @@ var require_encoderFlags = __commonJS({
     };
     var formatSvtForAv1an = ({ entries, hdrSvt }) => entries.map(([k, v]) => `--${k} ${v}`).concat(hdrSvt || []).filter(Boolean).join(" ");
     var formatSvtForAbAv1 = ({ entries }) => entries.map(([k, v]) => `--svt ${k}=${v}`).join(" ");
-    var buildSvtFlags = (preset, hdrSvt) => formatSvtForAv1an(svtConfig(preset, hdrSvt));
-    var buildAbAv1SvtFlags = () => {
+    var buildSvtFlags = (preset, hdrSvt, extra = "") => [formatSvtForAv1an(svtConfig(preset, hdrSvt)), extra].filter(Boolean).join(" ");
+    var buildAbAv1SvtFlags = (extra = "") => {
       const cfg = svtConfig(0, "");
       const skip = /* @__PURE__ */ new Set(["rc", "preset", "input-depth", "keyint"]);
       const filtered = { entries: cfg.entries.filter(([k]) => !skip.has(k)), hdrSvt: "" };
-      return [formatSvtForAbAv1(filtered), "--keyint 10s", "--scd true"].join(" ");
+      return [formatSvtForAbAv1(filtered), "--keyint 10s", "--scd true", extra].filter(Boolean).join(" ");
     };
     var buildAbAv1AomFlags = (preset, hdrAom) => {
       const ffmpegArgs = [
@@ -899,6 +899,54 @@ var details = () => ({
       defaultValue: "1080p",
       inputUI: { type: "dropdown", options: ["720p", "1080p", "1440p"] },
       tooltip: "Target resolution for downscaling. Only used when downscale is enabled."
+    },
+    {
+      label: "VMAF Floor",
+      name: "vmaf_floor",
+      type: "number",
+      defaultValue: "0",
+      inputUI: { type: "text" },
+      tooltip: "Fallback: if Target VMAF cannot be met under Max Encoded Percent, step the target DOWN to this floor (reusing the cached scans) and take the closest achievable. 0 = disabled."
+    },
+    {
+      label: "VMAF Step",
+      name: "vmaf_step",
+      type: "number",
+      defaultValue: "1",
+      inputUI: { type: "text" },
+      tooltip: "Decrement per fallback rung between Target VMAF and VMAF Floor (e.g. 1 -> 95,94,93...)."
+    },
+    {
+      label: "Custom SVT-AV1 Params",
+      name: "custom_svt_params",
+      type: "string",
+      defaultValue: "",
+      inputUI: { type: "text" },
+      tooltip: "Extra SVT-AV1 (Tritium) params in av1an form, e.g. '--ac-bias 1.0 --variance-boost-curve 3 --tune 0'. Applied to BOTH the CRF search and the final encode."
+    },
+    {
+      label: "Keep Dolby Vision RPU Sidecar",
+      name: "dv_rpu_sidecar",
+      type: "boolean",
+      defaultValue: "true",
+      inputUI: { type: "switch" },
+      tooltip: "If the source has Dolby Vision, extract its RPU to a .dvrpu.bin sidecar beside the source (fallback/archival, re-injectable later). Needs dovi_tool in the image."
+    },
+    {
+      label: "Inject Dolby Vision into AV1",
+      name: "dv_rpu_inject",
+      type: "boolean",
+      defaultValue: "false",
+      inputUI: { type: "switch" },
+      tooltip: "Inject the DV RPU into the AV1 output (Profile 10.1). OFF by default: AV1 DV is embed-only and not yet readable by common tooling or most players. Enable when support matures."
+    },
+    {
+      label: "Inject HDR10+ into AV1",
+      name: "hdr10plus_inject",
+      type: "boolean",
+      defaultValue: "true",
+      inputUI: { type: "switch" },
+      tooltip: "If the source has HDR10+ dynamic metadata, carry it into the AV1 output. Needs hdr10plus_tool in the image."
     }
   ],
   outputs: [
@@ -931,6 +979,12 @@ var plugin = async (args) => {
   const maxEncodedPercent = Number(inputs.max_encoded_percent) || 80;
   const downscaleEnabled = inputs.downscale_enabled === true || inputs.downscale_enabled === "true";
   const downscaleRes = String(inputs.downscale_resolution || "1080p");
+  const vmafFloor = Number(inputs.vmaf_floor) || 0;
+  const vmafStep = Number(inputs.vmaf_step) || 1;
+  const customSvtParams = String(inputs.custom_svt_params || "").trim();
+  const dvRpuSidecar = inputs.dv_rpu_sidecar === void 0 ? true : inputs.dv_rpu_sidecar === true || inputs.dv_rpu_sidecar === "true";
+  const dvRpuInject = inputs.dv_rpu_inject === true || inputs.dv_rpu_inject === "true";
+  const hdr10plusInject = inputs.hdr10plus_inject === void 0 ? true : inputs.hdr10plus_inject === true || inputs.hdr10plus_inject === "true";
   const findBin = (name, ...paths) => paths.find((p) => fs.existsSync(p)) || (() => {
     throw new Error(`Required binary not found: ${name} (checked ${paths.join(", ")})`);
   })();
@@ -941,6 +995,9 @@ var plugin = async (args) => {
     vspipe: findBin("vspipe", "/usr/local/bin/vspipe", "/usr/bin/vspipe"),
     mkvmerge: findBin("mkvmerge", "/usr/local/bin/mkvmerge", "/usr/bin/mkvmerge")
   };
+  const optBin = (...paths) => paths.find((p) => fs.existsSync(p)) || null;
+  const DOVI_TOOL = optBin("/usr/local/bin/dovi_tool", "/usr/bin/dovi_tool");
+  const HDR10PLUS_TOOL = optBin("/usr/local/bin/hdr10plus_tool", "/usr/bin/hdr10plus_tool");
   const vmafModel = "/usr/local/share/vmaf/vmaf_v0.6.1.json";
   if (!fs.existsSync(vmafModel)) throw new Error(`VMAF model not found: ${vmafModel}`);
   const { jobLog, dbg } = createLogger(args.jobLog, args.workDir);
@@ -972,6 +1029,69 @@ var plugin = async (args) => {
   fs.mkdirSync(vsDir, { recursive: true });
   fs.mkdirSync(av1anTemp, { recursive: true });
   fs.mkdirSync(searchDir, { recursive: true });
+  let dvRpuPath = "";
+  let hdr10plusPath = "";
+  const isHdrSvt = encoder !== "aom" && !!hdrSvt;
+  const srcHasDv = (stream.side_data_list || []).some((d) => /dovi|dolby vision/i.test(d.side_data_type || ""));
+  if (isHdrSvt && (dvRpuSidecar || dvRpuInject)) {
+    if (!DOVI_TOOL) {
+      jobLog("[dv] dovi_tool not present in image -- skipping Dolby Vision");
+    } else if (!srcHasDv) {
+      dbg("[dv] source has no Dolby Vision RPU -- skipping");
+    } else {
+      const sidecar = inputPath.replace(/\.[^./]+$/, "") + ".dvrpu.bin";
+      const workRpu = path.join(workBase, "source.dvrpu.bin");
+      let rpu = fs.existsSync(sidecar) && fs.statSync(sidecar).size > 0 ? sidecar : "";
+      if (rpu) {
+        jobLog(`[dv] using existing RPU sidecar: ${sidecar}`);
+      } else {
+        jobLog("[dv] extracting Dolby Vision RPU from source...");
+        const ex = await pm.spawnAsync(DOVI_TOOL, ["extract-rpu", "-i", inputPath, "-o", workRpu], { cwd: workBase, silent: true });
+        if (ex === 0 && fs.existsSync(workRpu) && fs.statSync(workRpu).size > 0) {
+          rpu = workRpu;
+          if (dvRpuSidecar) {
+            try {
+              fs.copyFileSync(workRpu, sidecar);
+              jobLog(`[dv] RPU sidecar saved beside source: ${sidecar}`);
+            } catch (e) {
+              jobLog(`[dv] could not write sidecar (${e.message})`);
+            }
+          }
+        } else {
+          jobLog("[dv] RPU extraction failed -- continuing without DV");
+        }
+      }
+      if (rpu && dvRpuInject) {
+        dvRpuPath = rpu;
+        jobLog("[dv] DV RPU will be injected into the AV1 output (Profile 10.1)");
+      } else if (rpu) jobLog("[dv] DV RPU kept as sidecar only (AV1 injection disabled)");
+    }
+  }
+  if (isHdrSvt && hdr10plusInject) {
+    if (!HDR10PLUS_TOOL) {
+      jobLog("[hdr10+] hdr10plus_tool not present in image -- skipping HDR10+");
+    } else {
+      const workJson = path.join(workBase, "source.hdr10plus.json");
+      jobLog("[hdr10+] checking source for HDR10+ metadata...");
+      const ex = await pm.spawnAsync(HDR10PLUS_TOOL, ["extract", "-i", inputPath, "-o", workJson], { cwd: workBase, silent: true });
+      if (ex === 0 && fs.existsSync(workJson) && fs.statSync(workJson).size > 2) {
+        hdr10plusPath = workJson;
+        jobLog("[hdr10+] HDR10+ metadata found -- will inject into the AV1 output");
+      } else {
+        dbg("[hdr10+] no HDR10+ metadata (or extraction failed) -- skipping");
+        try {
+          fs.unlinkSync(workJson);
+        } catch (_) {
+        }
+      }
+    }
+  }
+  const finalExtraSvt = [
+    dvRpuPath ? `--dolby-vision-rpu ${dvRpuPath}` : "",
+    hdr10plusPath ? `--hdr10plus-json ${hdr10plusPath}` : "",
+    customSvtParams
+  ].filter(Boolean).join(" ");
+  const searchExtraSvt = customSvtParams ? customSvtParams.replace(/--(\S+)\s+(\S+)/g, "--svt $1=$2") : "";
   const lwiCache = path.join(vsDir, "source.lwi");
   const vpyScript = path.join(vsDir, "source.vpy");
   const escPy = (s) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -1028,10 +1148,18 @@ var plugin = async (args) => {
     }
   })();
   updateWorker({ percentage: 0, startTime: Date.now(), status: "CRF Search" });
-  const searchEncFlags = encoder === "aom" ? buildAbAv1AomFlags(encPreset, hdrAom) : buildAbAv1SvtFlags();
+  const searchEncFlags = encoder === "aom" ? buildAbAv1AomFlags(encPreset, hdrAom) : buildAbAv1SvtFlags(searchExtraSvt);
   const abEncoder = encoder === "aom" ? "libaom-av1" : "libsvtav1";
   const searchVmafThreads = os.cpus().length;
-  const abArgs = [
+  const vmafLadder = [];
+  {
+    const top = targetVmaf;
+    const floor = vmafFloor > 0 && vmafFloor < top ? vmafFloor : top;
+    const step = vmafStep > 0 ? vmafStep : 1;
+    for (let v = top; v > floor + 1e-9; v -= step) vmafLadder.push(Math.round(v * 100) / 100);
+    vmafLadder.push(floor);
+  }
+  const abArgsBase = [
     "crf-search",
     "--input",
     inputPath,
@@ -1039,8 +1167,6 @@ var plugin = async (args) => {
     abEncoder,
     "--preset",
     String(encPreset),
-    "--min-vmaf",
-    String(targetVmaf),
     "--min-crf",
     String(minCrf),
     "--max-crf",
@@ -1050,20 +1176,17 @@ var plugin = async (args) => {
     "--max-encoded-percent",
     String(maxEncodedPercent),
     "--cache",
-    "false"
+    "true"
+    // cache samples so each ladder rung reuses prior scans (cleared on success)
   ];
-  if (doDownscale) {
-    abArgs.push(...buildAbAv1DownscaleArgs(downscaleRes));
-  }
-  searchEncFlags.split(/\s+/).filter(Boolean).forEach((tok) => abArgs.push(tok));
-  jobLog(`[phase 1] ab-av1 ${abArgs.map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ")}`);
+  if (doDownscale) abArgsBase.push(...buildAbAv1DownscaleArgs(downscaleRes));
+  searchEncFlags.split(/\s+/).filter(Boolean).forEach((tok) => abArgsBase.push(tok));
   let crfSearchFailed = false;
   let foundCrf = null;
+  let currentTarget = targetVmaf;
   const onSearchLine = (line) => {
     dbg(`[ab-av1] ${line}`);
-    if (/command::crf_search\]/i.test(line)) {
-      jobLog(line);
-    }
+    if (/command::crf_search\]/i.test(line)) jobLog(line);
     const successMatch = line.match(/crf\s+([\d.]+)\s+successful/i);
     if (successMatch) {
       foundCrf = parseFloat(successMatch[1]);
@@ -1075,9 +1198,7 @@ var plugin = async (args) => {
       const crf = parseFloat(crfMatch[1]);
       const vmaf = parseFloat(crfMatch[2]);
       dbg(`[crf-search] candidate crf=${crf} vmaf=${vmaf}`);
-      if (vmaf >= targetVmaf) {
-        foundCrf = crf;
-      }
+      if (vmaf >= currentTarget) foundCrf = crf;
     }
     if (/failed to find a suitable crf/i.test(line)) {
       jobLog("[crf-search] could not find a suitable CRF");
@@ -1087,28 +1208,39 @@ var plugin = async (args) => {
       jobLog("[crf-search] estimated output exceeds max-encoded-percent limit");
       crfSearchFailed = true;
     }
-    if (/\b(error|warn|panic|failed|abort)\b/i.test(line)) {
-      jobLog(line);
-    }
+    if (/\b(error|warn|panic|failed|abort)\b/i.test(line)) jobLog(line);
   };
   pm.installCancelHandler(() => {
   });
-  const abExit = await pm.spawnAsync(BIN.ab_av1, abArgs, {
-    cwd: searchDir,
-    onLine: onSearchLine,
-    filter: () => false,
-    onSpawn: (pid) => pm.startPpidWatcher(pid)
-  });
-  if (abExit !== 0 && !crfSearchFailed) {
-    jobLog("[scene-detect] aborting (ab-av1 crashed)");
-    pm.cleanup();
-    throw new Error(`ab-av1 crashed (exit code ${abExit}) -- check logs for OOM or other fatal errors`);
+  for (let i = 0; i < vmafLadder.length; i++) {
+    currentTarget = vmafLadder[i];
+    crfSearchFailed = false;
+    foundCrf = null;
+    const abArgs = [...abArgsBase, "--min-vmaf", String(currentTarget)];
+    if (i === 0) {
+      jobLog(`[phase 1] ab-av1 ${abArgs.map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ")}`);
+    } else {
+      jobLog(`[phase 1] VMAF ${vmafLadder[i - 1]} unobtainable under ${maxEncodedPercent}% -- stepping down to VMAF ${currentTarget} (reusing cached scans)`);
+      updateWorker({ status: `CRF Search (VMAF ${currentTarget})` });
+    }
+    const abExit = await pm.spawnAsync(BIN.ab_av1, abArgs, {
+      cwd: searchDir,
+      onLine: onSearchLine,
+      filter: () => false,
+      onSpawn: (pid) => pm.startPpidWatcher(pid)
+    });
+    if (abExit !== 0 && !crfSearchFailed) {
+      jobLog("[scene-detect] aborting (ab-av1 crashed)");
+      pm.cleanup();
+      throw new Error(`ab-av1 crashed (exit code ${abExit}) -- check logs for OOM or other fatal errors`);
+    }
+    if (foundCrf != null) break;
   }
-  if (crfSearchFailed || foundCrf == null) {
-    jobLog("[scene-detect] aborting (CRF search did not succeed)");
+  if (foundCrf == null) {
+    jobLog("[scene-detect] aborting (CRF search did not succeed at any VMAF rung)");
     pm.cleanup();
     jobLog("=".repeat(64));
-    jobLog("CRF SEARCH FAILED -- criteria not met");
+    jobLog(`CRF SEARCH FAILED -- could not meet VMAF down to floor ${vmafLadder[vmafLadder.length - 1]} under ${maxEncodedPercent}% size cap`);
     jobLog("=".repeat(64));
     return {
       outputFileObj: args.inputFileObj,
@@ -1116,7 +1248,7 @@ var plugin = async (args) => {
       variables: args.variables
     };
   }
-  jobLog(`[phase 1] found CRF ${foundCrf} meeting VMAF >= ${targetVmaf}`);
+  jobLog(`[phase 1] found CRF ${foundCrf} meeting VMAF >= ${currentTarget}${currentTarget !== targetVmaf ? ` (fallback from target ${targetVmaf})` : ""}`);
   let sceneDetectDone = false;
   sceneDetectPromise.then(() => {
     sceneDetectDone = true;
@@ -1138,7 +1270,7 @@ var plugin = async (args) => {
   jobLog(`[scene-detect] scenes written to ${scenesPath}`);
   updateWorker({ percentage: 0, status: "Encoding" });
   const audioSizeGb = await probeAudioSize(inputPath, args.workDir, dbg, dbg);
-  const encFlags = encoder === "aom" ? buildAomFlags(encPreset, hdrAom) + ` --cq-level=${foundCrf}` : buildSvtFlags(encPreset, hdrSvt) + ` --crf ${foundCrf}`;
+  const encFlags = encoder === "aom" ? buildAomFlags(encPreset, hdrAom) + ` --cq-level=${foundCrf}` : buildSvtFlags(encPreset, hdrSvt, finalExtraSvt) + ` --crf ${foundCrf}`;
   jobLog(`[phase 2] enc flags: ${encFlags}`);
   const av1anArgs = [
     "-i",
@@ -1254,6 +1386,11 @@ var plugin = async (args) => {
   jobLog(`  output  : ${humanSize(outBytes)}  (${pct}% reduction)`);
   jobLog("=".repeat(64));
   updateWorker({ percentage: 100 });
+  try {
+    fs.rmSync(searchDir, { recursive: true, force: true });
+    dbg("[cache] cleared ab-av1 sample cache after successful encode");
+  } catch (_) {
+  }
   return {
     outputFileObj: Object.assign({}, file, { _id: outputPath, file: outputPath }),
     outputNumber: 1,

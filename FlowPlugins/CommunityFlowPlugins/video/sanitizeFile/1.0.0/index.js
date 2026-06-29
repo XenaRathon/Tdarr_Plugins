@@ -483,7 +483,7 @@ function categorizeStreams(streams) {
   }
   return { video, audio, subtitle, image };
 }
-function selectAudio(audioTracks, originalLang, additionalLangs, keepCommentary) {
+function selectAudio(audioTracks, originalLang, additionalLangs, keepCommentary, keepAll) {
   if (audioTracks.length <= 1) return audioTracks;
   const mainWanted = [originalLang, ...additionalLangs.filter((l) => l !== originalLang)];
   function bestForLang(lang) {
@@ -495,10 +495,20 @@ function selectAudio(audioTracks, originalLang, additionalLangs, keepCommentary)
   const selected = [];
   const seenIdx = /* @__PURE__ */ new Set();
   for (const lang of mainWanted) {
-    const best = bestForLang(lang);
-    if (best && !seenIdx.has(best.idx)) {
-      selected.push(best);
-      seenIdx.add(best.idx);
+    if (keepAll) {
+      const matches = audioTracks.filter((t) => !t.commentary && t.lang === lang).sort((a, b) => b.channels - a.channels || a.rank - b.rank);
+      for (const m of matches) {
+        if (!seenIdx.has(m.idx)) {
+          selected.push(m);
+          seenIdx.add(m.idx);
+        }
+      }
+    } else {
+      const best = bestForLang(lang);
+      if (best && !seenIdx.has(best.idx)) {
+        selected.push(best);
+        seenIdx.add(best.idx);
+      }
     }
   }
   if (keepCommentary) {
@@ -530,6 +540,67 @@ function selectSubtitles(subTracks, originalLang, subLangs, keepCommentary) {
     if (byLang.has(lang)) ordered.push(...byLang.get(lang));
   }
   return ordered;
+}
+var SIDE_SUB_EXTS = /* @__PURE__ */ new Set([".srt", ".ass", ".ssa", ".vtt", ".sub"]);
+var LANG2TO3 = {
+  en: "eng",
+  ja: "jpn",
+  jp: "jpn",
+  es: "spa",
+  fr: "fra",
+  de: "deu",
+  it: "ita",
+  pt: "por",
+  ru: "rus",
+  ko: "kor",
+  zh: "zho",
+  sv: "swe",
+  nl: "nld",
+  pl: "pol",
+  da: "dan",
+  fi: "fin",
+  no: "nor",
+  cs: "ces",
+  hu: "hun",
+  tr: "tur",
+  ar: "ara",
+  he: "heb",
+  el: "ell",
+  th: "tha"
+};
+function normSubLang(tok) {
+  const t = (tok || "").toLowerCase();
+  if (t.length === 3) return t;
+  return LANG2TO3[t] || null;
+}
+function findSidecarSubs(fs, path, filePath, wantedLangs, originalLang) {
+  const dir = path.dirname(filePath);
+  const base = path.parse(filePath).name;
+  let files = [];
+  try {
+    files = fs.readdirSync(dir);
+  } catch (_) {
+    return [];
+  }
+  const out = [];
+  for (const f of files) {
+    const ext = path.extname(f).toLowerCase();
+    if (!SIDE_SUB_EXTS.has(ext)) continue;
+    const stem = path.parse(f).name;
+    if (stem !== base && !stem.startsWith(base + ".")) continue;
+    const toks = stem.slice(base.length).split(".").filter(Boolean);
+    let lang = null, forced = false, sdh = false;
+    for (const t of toks) {
+      const L = normSubLang(t);
+      if (L) lang = L;
+      if (/^forced$/i.test(t)) forced = true;
+      if (/^(sdh|hi|cc)$/i.test(t)) sdh = true;
+    }
+    if (!lang) lang = originalLang || "und";
+    if (wantedLangs.size && !wantedLangs.has(lang)) continue;
+    out.push({ file: path.join(dir, f), lang, forced, sdh });
+  }
+  return out;
 }
 var details = () => ({
   name: "Sanitize File",
@@ -611,6 +682,22 @@ var details = () => ({
       defaultValue: "false",
       inputUI: { type: "switch" },
       tooltip: 'Keep commentary audio/subtitle tracks (detected via the comment disposition or a "commentary" title; SDH/forced are not commentary). When off, commentaries are removed even if they are the only track in a wanted language. Commentary tracks follow the additional-language lists only \u2014 the original language is not auto-kept for commentaries.'
+    },
+    {
+      label: "Keep ALL Audio Per Language",
+      name: "keep_all_audio_per_language",
+      type: "boolean",
+      defaultValue: "false",
+      inputUI: { type: "switch" },
+      tooltip: "When ON, keep EVERY audio track whose language is wanted (original + additional), not just the single best one per language. (Subtitles already keep all matching-language tracks.)"
+    },
+    {
+      label: "Mux Sidecar Subtitles",
+      name: "mux_sidecar_subs",
+      type: "boolean",
+      defaultValue: "false",
+      inputUI: { type: "switch" },
+      tooltip: "Find external subtitle files beside the source (.srt/.ass/.ssa/.vtt/.sub named like the video, e.g. Movie.eng.forced.srt) whose language matches a wanted subtitle language, and mux them in as tracks. Language/forced/SDH are parsed from the filename."
     }
   ],
   outputs: [
@@ -632,6 +719,8 @@ var plugin = async (args) => {
   const additionalAudioLangs = (inputs.additional_audio_languages || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   const subtitleLangs = (inputs.subtitle_languages || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   const keepCommentary = inputs.keep_commentary_tracks === true || inputs.keep_commentary_tracks === "true";
+  const keepAllAudioPerLang = inputs.keep_all_audio_per_language === true || inputs.keep_all_audio_per_language === "true";
+  const muxSidecarSubs = inputs.mux_sidecar_subs === true || inputs.mux_sidecar_subs === "true";
   const log = (msg) => {
     if (typeof args.jobLog === "function") args.jobLog(msg);
     else console.log(`[Sanitize] ${msg}`);
@@ -673,7 +762,7 @@ var plugin = async (args) => {
   }
   const { video, audio, subtitle, image } = categorizeStreams(streams);
   log(`Streams: ${video.length} video, ${audio.length} audio, ${subtitle.length} sub, ${image.length} image`);
-  const selectedAudio = originalLang ? selectAudio(audio, originalLang, additionalAudioLangs, keepCommentary) : audio;
+  const selectedAudio = originalLang ? selectAudio(audio, originalLang, additionalAudioLangs, keepCommentary, keepAllAudioPerLang) : audio;
   const selectedSubs = originalLang ? selectSubtitles(subtitle, originalLang, subtitleLangs, keepCommentary) : subtitle;
   log(`Keeping: ${selectedAudio.length} audio, ${selectedSubs.length} subtitle`);
   for (const a of selectedAudio) {
@@ -681,6 +770,16 @@ var plugin = async (args) => {
   }
   for (const s of selectedSubs) {
     log(`  sub: [${s.lang}] ${s.stream.codec_name} (stream ${s.idx})`);
+  }
+  let sidecarSubs = [];
+  if (muxSidecarSubs) {
+    const wantedSubLangs = new Set([originalLang, ...subtitleLangs].filter(Boolean));
+    sidecarSubs = findSidecarSubs(fs, path, filePath, wantedSubLangs, originalLang);
+    if (sidecarSubs.length) {
+      log(`Sidecar subtitles to mux: ${sidecarSubs.map((s) => `[${s.lang}]${s.forced ? "(forced)" : ""} ${path.basename(s.file)}`).join(", ")}`);
+    } else {
+      log("Sidecar mux enabled but no matching sub files found beside source");
+    }
   }
   const ext = path.extname(filePath).toLowerCase();
   const isMkv = ext === ".mkv";
@@ -692,7 +791,7 @@ var plugin = async (args) => {
   const lastAudioIdx = selectedAudio.length > 0 ? Math.max(...selectedAudio.map((a) => a.idx)) : -1;
   const firstSubIdx = selectedSubs.length > 0 ? Math.min(...selectedSubs.map((s) => s.idx)) : Infinity;
   const orderCorrect = lastVideoIdx < firstAudioIdx && lastAudioIdx < firstSubIdx;
-  if (isMkv && noImages && audioMatch && subMatch && orderCorrect) {
+  if (isMkv && noImages && audioMatch && subMatch && orderCorrect && sidecarSubs.length === 0) {
     log("File already clean \u2014 no changes needed");
     return {
       outputFileObj: args.inputFileObj,
@@ -703,10 +802,12 @@ var plugin = async (args) => {
   const videoIds = video.map((v) => v.idx).join(",");
   const audioIds = selectedAudio.map((a) => a.idx).join(",");
   const subIds = selectedSubs.map((s) => s.idx).join(",");
+  const sidecarOrder = sidecarSubs.map((_, i) => `${i + 1}:0`);
   const trackOrder = [
     ...video.map((v) => `0:${v.idx}`),
     ...selectedAudio.map((a) => `0:${a.idx}`),
-    ...selectedSubs.map((s) => `0:${s.idx}`)
+    ...selectedSubs.map((s) => `0:${s.idx}`),
+    ...sidecarOrder
   ].join(",");
   const outputName = `${path.parse(filePath).name}.sanitized.mkv`;
   const outputPath = path.join(args.workDir, outputName);
@@ -714,16 +815,22 @@ var plugin = async (args) => {
     "-q",
     "-o",
     outputPath,
+    "--track-order",
+    trackOrder,
     "--no-attachments",
     "-d",
     videoIds,
     "-a",
     audioIds,
     ...selectedSubs.length > 0 ? ["-s", subIds] : ["-S"],
-    "--track-order",
-    trackOrder,
     filePath
   ];
+  for (const sc of sidecarSubs) {
+    mkvmergeArgs.push("--language", `0:${sc.lang}`);
+    if (sc.forced) mkvmergeArgs.push("--forced-track", "0:yes");
+    if (sc.sdh) mkvmergeArgs.push("--track-name", "0:SDH");
+    mkvmergeArgs.push(sc.file);
+  }
   const totalStreams = video.length + selectedAudio.length + selectedSubs.length;
   log(`Running mkvmerge with ${totalStreams} tracks...`);
   const updateWorker = (fields) => {

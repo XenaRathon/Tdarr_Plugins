@@ -326,12 +326,12 @@ var require_encoderFlags = __commonJS({
     };
     var formatSvtForAv1an = ({ entries, hdrSvt }) => entries.map(([k, v]) => `--${k} ${v}`).concat(hdrSvt || []).filter(Boolean).join(" ");
     var formatSvtForAbAv1 = ({ entries }) => entries.map(([k, v]) => `--svt ${k}=${v}`).join(" ");
-    var buildSvtFlags = (preset, hdrSvt) => formatSvtForAv1an(svtConfig(preset, hdrSvt));
-    var buildAbAv1SvtFlags = () => {
+    var buildSvtFlags = (preset, hdrSvt, extra = "") => [formatSvtForAv1an(svtConfig(preset, hdrSvt)), extra].filter(Boolean).join(" ");
+    var buildAbAv1SvtFlags = (extra = "") => {
       const cfg = svtConfig(0, "");
       const skip = /* @__PURE__ */ new Set(["rc", "preset", "input-depth", "keyint"]);
       const filtered = { entries: cfg.entries.filter(([k]) => !skip.has(k)), hdrSvt: "" };
-      return [formatSvtForAbAv1(filtered), "--keyint 10s", "--scd true"].join(" ");
+      return [formatSvtForAbAv1(filtered), "--keyint 10s", "--scd true", extra].filter(Boolean).join(" ");
     };
     var buildAbAv1AomFlags = (preset, hdrAom) => {
       const ffmpegArgs = [
