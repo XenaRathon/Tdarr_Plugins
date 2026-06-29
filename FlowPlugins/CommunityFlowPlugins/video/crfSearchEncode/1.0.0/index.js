@@ -1186,19 +1186,17 @@ var plugin = async (args) => {
   const onSearchLine = (line) => {
     dbg(`[ab-av1] ${line}`);
     if (/command::crf_search\]/i.test(line)) jobLog(line);
-    const successMatch = line.match(/crf\s+([\d.]+)\s+successful/i);
+    const successMatch = line.match(/\bcrf\s+([0-9]+(?:\.[0-9]+)?)\s+successful/i);
     if (successMatch) {
-      foundCrf = parseFloat(successMatch[1]);
-      dbg(`[crf-search] success: crf=${foundCrf}`);
+      const c = parseFloat(successMatch[1]);
+      if (c >= minCrf && c <= maxCrf) {
+        foundCrf = c;
+        dbg(`[crf-search] success: crf=${foundCrf}`);
+      } else dbg(`[crf-search] ignoring out-of-range crf=${c}`);
       return;
     }
-    const crfMatch = line.match(/crf\s+([\d.]+)\s+.*VMAF\s+([\d.]+)/i);
-    if (crfMatch) {
-      const crf = parseFloat(crfMatch[1]);
-      const vmaf = parseFloat(crfMatch[2]);
-      dbg(`[crf-search] candidate crf=${crf} vmaf=${vmaf}`);
-      if (vmaf >= currentTarget) foundCrf = crf;
-    }
+    const cand = line.match(/\bcrf\s+([0-9]+(?:\.[0-9]+)?)\s+.*VMAF\s+([0-9]+(?:\.[0-9]+)?)/i);
+    if (cand) dbg(`[crf-search] candidate crf=${cand[1]} vmaf=${cand[2]} (not accepted unless 'successful')`);
     if (/failed to find a suitable crf/i.test(line)) {
       jobLog("[crf-search] could not find a suitable CRF");
       crfSearchFailed = true;
@@ -1233,7 +1231,7 @@ var plugin = async (args) => {
       pm.cleanup();
       throw new Error(`ab-av1 crashed (exit code ${abExit}) -- check logs for OOM or other fatal errors`);
     }
-    if (foundCrf != null) break;
+    if (foundCrf != null && !crfSearchFailed) break;
   }
   if (foundCrf == null) {
     jobLog("[scene-detect] aborting (CRF search did not succeed at any VMAF rung)");
