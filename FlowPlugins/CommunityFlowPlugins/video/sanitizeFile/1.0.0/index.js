@@ -443,6 +443,11 @@ function codecRank(codecName, profile) {
   if (name === "dts" && profile && /\bma\b/i.test(profile)) return CODEC_RANK["dts-hd ma"];
   return CODEC_RANK[name] || WORST_RANK;
 }
+function isCommentary(stream) {
+  if (stream && stream.disposition && stream.disposition.comment === 1) return true;
+  const title = stream && stream.tags && stream.tags.title;
+  return /commentary/i.test(title || "");
+}
 function categorizeStreams(streams) {
   const video = [];
   const audio = [];
@@ -464,44 +469,57 @@ function categorizeStreams(streams) {
         stream: s,
         lang: (s.tags && s.tags.language || "").toLowerCase(),
         channels: s.channels || 0,
-        rank: codecRank(s.codec_name, s.profile)
+        rank: codecRank(s.codec_name, s.profile),
+        commentary: isCommentary(s)
       });
     } else if (s.codec_type === "subtitle") {
       subtitle.push({
         idx,
         stream: s,
-        lang: (s.tags && s.tags.language || "").toLowerCase()
+        lang: (s.tags && s.tags.language || "").toLowerCase(),
+        commentary: isCommentary(s)
       });
     }
   }
   return { video, audio, subtitle, image };
 }
-function selectAudio(audioTracks, originalLang, additionalLangs) {
+function selectAudio(audioTracks, originalLang, additionalLangs, keepCommentary) {
   if (audioTracks.length <= 1) return audioTracks;
-  const wantedLangs = [originalLang, ...additionalLangs.filter((l) => l !== originalLang)];
+  const mainWanted = [originalLang, ...additionalLangs.filter((l) => l !== originalLang)];
   function bestForLang(lang) {
-    const matches = audioTracks.filter((t) => t.lang === lang);
+    const matches = audioTracks.filter((t) => !t.commentary && t.lang === lang);
     if (matches.length === 0) return null;
     matches.sort((a, b) => b.channels - a.channels || a.rank - b.rank);
     return matches[0];
   }
   const selected = [];
   const seenIdx = /* @__PURE__ */ new Set();
-  for (const lang of wantedLangs) {
+  for (const lang of mainWanted) {
     const best = bestForLang(lang);
     if (best && !seenIdx.has(best.idx)) {
       selected.push(best);
       seenIdx.add(best.idx);
     }
   }
+  if (keepCommentary) {
+    const commentaryLangs = new Set(additionalLangs);
+    for (const t of audioTracks) {
+      if (t.commentary && commentaryLangs.has(t.lang) && !seenIdx.has(t.idx)) {
+        selected.push(t);
+        seenIdx.add(t.idx);
+      }
+    }
+  }
   if (selected.length === 0) return audioTracks;
   return selected;
 }
-function selectSubtitles(subTracks, originalLang, subLangs) {
-  const wantedLangs = /* @__PURE__ */ new Set([originalLang, ...subLangs]);
+function selectSubtitles(subTracks, originalLang, subLangs, keepCommentary) {
+  const mainWanted = /* @__PURE__ */ new Set([originalLang, ...subLangs]);
+  const commentaryLangs = new Set(subLangs);
   const byLang = /* @__PURE__ */ new Map();
   for (const t of subTracks) {
-    if (wantedLangs.has(t.lang)) {
+    const keep = t.commentary ? keepCommentary && commentaryLangs.has(t.lang) : mainWanted.has(t.lang);
+    if (keep) {
       if (!byLang.has(t.lang)) byLang.set(t.lang, []);
       byLang.get(t.lang).push(t);
     }
@@ -585,6 +603,14 @@ var details = () => ({
       defaultValue: "",
       inputUI: { type: "text" },
       tooltip: "Comma-separated ISO 639-2 codes for extra subtitle languages to keep (e.g. eng,swe). The original language subtitles are always kept."
+    },
+    {
+      label: "Keep Commentary Tracks",
+      name: "keep_commentary_tracks",
+      type: "boolean",
+      defaultValue: "false",
+      inputUI: { type: "switch" },
+      tooltip: 'Keep commentary audio/subtitle tracks (detected via the comment disposition or a "commentary" title; SDH/forced are not commentary). When off, commentaries are removed even if they are the only track in a wanted language. Commentary tracks follow the additional-language lists only \u2014 the original language is not auto-kept for commentaries.'
     }
   ],
   outputs: [
@@ -605,6 +631,7 @@ var plugin = async (args) => {
   const sonarrKey = (inputs.sonarr_api_key || "").trim();
   const additionalAudioLangs = (inputs.additional_audio_languages || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   const subtitleLangs = (inputs.subtitle_languages || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const keepCommentary = inputs.keep_commentary_tracks === true || inputs.keep_commentary_tracks === "true";
   const log = (msg) => {
     if (typeof args.jobLog === "function") args.jobLog(msg);
     else console.log(`[Sanitize] ${msg}`);
@@ -646,8 +673,8 @@ var plugin = async (args) => {
   }
   const { video, audio, subtitle, image } = categorizeStreams(streams);
   log(`Streams: ${video.length} video, ${audio.length} audio, ${subtitle.length} sub, ${image.length} image`);
-  const selectedAudio = originalLang ? selectAudio(audio, originalLang, additionalAudioLangs) : audio;
-  const selectedSubs = originalLang ? selectSubtitles(subtitle, originalLang, subtitleLangs) : subtitle;
+  const selectedAudio = originalLang ? selectAudio(audio, originalLang, additionalAudioLangs, keepCommentary) : audio;
+  const selectedSubs = originalLang ? selectSubtitles(subtitle, originalLang, subtitleLangs, keepCommentary) : subtitle;
   log(`Keeping: ${selectedAudio.length} audio, ${selectedSubs.length} subtitle`);
   for (const a of selectedAudio) {
     log(`  audio: [${a.lang}] ${a.stream.codec_name} ${a.channels}ch (stream ${a.idx})`);
@@ -728,27 +755,18 @@ var plugin = async (args) => {
     log("mkvmerge warnings (exit 1) \u2014 treating as success");
   }
   log(`Output: ${outputPath}`);
-  args.inputFileObj._id = outputPath;
-  const scanArgs = {
-    _id: outputPath,
-    file: args.inputFileObj.file,
-    DB: args.inputFileObj.DB,
-    footprintId: args.inputFileObj.footprintId
-  };
-  const scanTypes = { exifToolScan: true, mediaInfoScan: false, closedCaptionScan: false };
-  if (typeof args.scanIndividualFile !== "undefined") {
-    log("Re-scanning remuxed file...");
-    const scannedFile = await args.scanIndividualFile(scanArgs, scanTypes);
-    return {
-      outputFileObj: scannedFile,
-      outputNumber: 1,
-      variables: args.variables
-    };
-  }
   return {
-    outputFileObj: args.inputFileObj,
+    outputFileObj: Object.assign({}, args.inputFileObj, { _id: outputPath, file: outputPath }),
     outputNumber: 1,
     variables: args.variables
   };
 };
-module.exports = { details, plugin };
+module.exports = {
+  details,
+  plugin,
+  // exported for unit tests
+  categorizeStreams,
+  selectAudio,
+  selectSubtitles,
+  isCommentary
+};
