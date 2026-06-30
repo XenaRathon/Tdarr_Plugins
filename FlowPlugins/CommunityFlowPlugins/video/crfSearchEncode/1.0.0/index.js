@@ -917,12 +917,12 @@ var details = () => ({
       tooltip: "Decrement per fallback rung between Target VMAF and VMAF Floor (e.g. 1 -> 95,94,93...)."
     },
     {
-      label: "CRF Search Samples",
+      label: "Max CRF Search Samples",
       name: "crf_search_samples",
       type: "number",
       defaultValue: "5",
       inputUI: { type: "text" },
-      tooltip: "Number of sample chunks ab-av1 encodes per CRF probe during phase 1. Fewer = faster search (big win on long films, where ab-av1 otherwise scales samples with duration) at a small accuracy cost. 0 = ab-av1 default. 5 is a good cap."
+      tooltip: "Ceiling on sample chunks per CRF probe in phase 1. The actual count SCALES with source duration -- reaching this max at ~90 min and floored at 2 -- so a 20-45 min episode uses fewer samples than a feature film, keeping phase 1 fast without over-sampling shorts. 0 = ab-av1 default (duration-scaled, uncapped)."
     },
     {
       label: "Custom SVT-AV1 Params",
@@ -1186,8 +1186,14 @@ var plugin = async (args) => {
     "true"
     // cache samples so each ladder rung reuses prior scans (cleared on success)
   ];
-  const crfSamples = Number(inputs.crf_search_samples) || 0;
-  if (crfSamples > 0) abArgsBase.push("--samples", String(crfSamples));
+  const maxSamples = Number(inputs.crf_search_samples) || 0;
+  if (maxSamples > 0) {
+    const durMin = (parseFloat(file.ffProbeData && file.ffProbeData.format && file.ffProbeData.format.duration || 0) || 0) / 60;
+    const perSample = 90 / maxSamples;
+    const crfSamples = durMin > 0 ? Math.max(2, Math.min(maxSamples, Math.round(durMin / perSample))) : maxSamples;
+    abArgsBase.push("--samples", String(crfSamples));
+    jobLog(`  samples    : ${crfSamples} (source ${durMin.toFixed(0)}m, max ${maxSamples}, floor 2)`);
+  }
   if (doDownscale) abArgsBase.push(...buildAbAv1DownscaleArgs(downscaleRes));
   searchEncFlags.split(/\s+/).filter(Boolean).forEach((tok) => abArgsBase.push(tok));
   let crfSearchFailed = false;
