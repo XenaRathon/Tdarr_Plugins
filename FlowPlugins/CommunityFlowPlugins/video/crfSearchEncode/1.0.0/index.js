@@ -885,6 +885,22 @@ var details = () => ({
       tooltip: "Abort if estimated output exceeds this % of source size. Applied to both CRF search and encode phases. Set to 100 to disable."
     },
     {
+      label: "Search Cap Margin %",
+      name: "search_cap_margin",
+      type: "number",
+      defaultValue: "5",
+      inputUI: { type: "text" },
+      tooltip: "Percentage points subtracted from Max Encoded Percent during the PHASE-1 CRF search only. The search predicts size from samples (which run a few % under the full encode), so searching against a tighter cap makes the VMAF ladder step down in the cheap phase when the target won't fit -- so the real encode lands under the true cap instead of being killed in phase 2. 0 = no margin. ~5 is a good default."
+    },
+    {
+      label: "Overshoot Tolerance %",
+      name: "overshoot_tolerance",
+      type: "number",
+      defaultValue: "2",
+      inputUI: { type: "text" },
+      tooltip: "Percentage points added to Max Encoded Percent for the PHASE-2 kill check, so a near-finished encode that lands just over the cap (e.g. 80.5% vs an 80% cap) is kept instead of killed at the wire and wastefully skipped. 0 = hard cap."
+    },
+    {
       label: "Enable Downscale",
       name: "downscale_enabled",
       type: "boolean",
@@ -1001,6 +1017,10 @@ var plugin = async (args) => {
   const maxCrf = Number(inputs.max_crf) || 50;
   const encPreset = Number(inputs.preset) || 4;
   const maxEncodedPercent = Number(inputs.max_encoded_percent) || 80;
+  const searchCapMargin = Math.max(0, Number(inputs.search_cap_margin) || 0);
+  const overshootTol = Math.max(0, Number(inputs.overshoot_tolerance) || 0);
+  const searchCapPercent = Math.max(1, maxEncodedPercent - searchCapMargin);
+  const encodeKillPercent = maxEncodedPercent + overshootTol;
   const downscaleEnabled = inputs.downscale_enabled === true || inputs.downscale_enabled === "true";
   const downscaleRes = String(inputs.downscale_resolution || "1080p");
   const vmafFloor = Number(inputs.vmaf_floor) || 0;
@@ -1143,7 +1163,7 @@ var plugin = async (args) => {
   jobLog(`  input      : ${inputPath}`);
   jobLog(`  resolution : ${stream.width || "?"}x${height || "?"}${doDownscale ? ` -> ${downscaleRes}` : ""}`);
   jobLog(`  target     : VMAF ${targetVmaf}  CRF ${minCrf}-${maxCrf}`);
-  jobLog(`  max size   : ${maxEncodedPercent}% of source`);
+  jobLog(`  max size   : ${maxEncodedPercent}% of source (search ${searchCapPercent}%, kill ${encodeKillPercent}%)`);
   jobLog(`  phase 1    : ab-av1 crf-search`);
   jobLog(`  phase 2    : av1an fixed-CRF`);
   jobLog("=".repeat(64));
@@ -1181,7 +1201,8 @@ var plugin = async (args) => {
     "--vmaf",
     `n_threads=${searchVmafThreads}:model=path=${vmafModel}`,
     "--max-encoded-percent",
-    String(maxEncodedPercent),
+    String(searchCapPercent),
+    // tighter than real cap -> ladder steps down in phase 1
     "--cache",
     "true"
     // cache samples so each ladder rung reuses prior scans (cleared on success)
@@ -1324,7 +1345,7 @@ var plugin = async (args) => {
     scenesFile: scenesPath,
     audioSizeGb,
     sourceSizeGb,
-    maxEncodedPercent,
+    maxEncodedPercent: encodeKillPercent,
     updateWorker,
     jobLog,
     dbg,
