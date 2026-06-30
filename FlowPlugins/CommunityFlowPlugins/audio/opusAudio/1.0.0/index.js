@@ -288,7 +288,7 @@ var plugin = async (args) => {
     return { outputFileObj: file, outputNumber: 2, variables: args.variables };
   }
   const targetKbps = (ch) => map[ch] || Math.max(48, ch * perCh);
-  const STD_SURROUND = /* @__PURE__ */ new Set(["3.0", "4.0", "quad", "5.0", "5.1", "5.1(side)", "6.1", "7.1", "7.1(wide)", "7.1(wide-side)"]);
+  const FAMILY1_OK = /* @__PURE__ */ new Set(["3.0", "4.0", "quad", "5.0", "5.1", "5.1(side)", "6.1", "7.1", "7.1(wide)", "7.1(wide-side)"]);
   let allOk = true;
   const plan = audio.map((s) => {
     const ch = s.channels || 2;
@@ -298,7 +298,7 @@ var plugin = async (args) => {
     const curKbps = s.bit_rate ? Math.round(parseInt(s.bit_rate, 10) / 1e3) : null;
     const ok = isOpus && (curKbps == null || curKbps <= tgt + 8);
     if (!ok) allOk = false;
-    const mf = ch <= 2 ? null : STD_SURROUND.has(layout) ? 1 : 255;
+    const mf = ch <= 2 || ch === 6 || ch === 8 || FAMILY1_OK.has(layout) ? null : 255;
     return { ch, tgt, isOpus, mf, layout };
   });
   if (skipIfOpus && allOk) {
