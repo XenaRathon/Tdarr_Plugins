@@ -288,7 +288,7 @@ var plugin = async (args) => {
     return { outputFileObj: file, outputNumber: 2, variables: args.variables };
   }
   const targetKbps = (ch) => map[ch] || Math.max(48, ch * perCh);
-  const FAMILY1_OK = /* @__PURE__ */ new Set(["3.0", "4.0", "quad", "5.0", "5.1", "5.1(side)", "6.1", "7.1", "7.1(wide)", "7.1(wide-side)"]);
+  const CANON = { 6: "5.1", 8: "7.1" };
   let allOk = true;
   const plan = audio.map((s) => {
     const ch = s.channels || 2;
@@ -298,8 +298,13 @@ var plugin = async (args) => {
     const curKbps = s.bit_rate ? Math.round(parseInt(s.bit_rate, 10) / 1e3) : null;
     const ok = isOpus && (curKbps == null || curKbps <= tgt + 8);
     if (!ok) allOk = false;
-    const mf = ch <= 2 || ch === 6 || ch === 8 || FAMILY1_OK.has(layout) ? null : 255;
-    return { ch, tgt, isOpus, mf, layout };
+    let filt = null;
+    let mf = null;
+    if (ch > 2) {
+      if (CANON[ch]) filt = CANON[ch];
+      else mf = 255;
+    }
+    return { ch, tgt, isOpus, filt, mf, layout };
   });
   if (skipIfOpus && allOk) {
     jobLog("[opus] all audio already Opus at/below target \u2014 passing through");
@@ -310,8 +315,9 @@ var plugin = async (args) => {
   const ffargs = ["-hide_banner", "-y", "-i", inputPath, "-map", "0", "-c", "copy", "-c:a", "libopus"];
   plan.forEach((p, ai) => {
     ffargs.push(`-b:a:${ai}`, `${p.tgt}k`);
-    if (p.mf != null) ffargs.push(`-mapping_family:a:${ai}`, String(p.mf));
-    jobLog(`  audio[${ai}]: ${p.ch}ch ${p.layout || "?"} -> Opus ${p.tgt}k${p.mf != null ? ` (mapping_family ${p.mf})` : ""}${p.isOpus ? " [re-encoding Opus]" : ""}`);
+    if (p.filt) ffargs.push(`-filter:a:${ai}`, `aformat=channel_layouts=${p.filt}`);
+    else if (p.mf != null) ffargs.push(`-mapping_family:a:${ai}`, String(p.mf));
+    jobLog(`  audio[${ai}]: ${p.ch}ch ${p.layout || "?"} -> Opus ${p.tgt}k${p.filt ? ` (remap ${p.filt})` : p.mf != null ? ` (mapping_family ${p.mf})` : ""}${p.isOpus ? " [re-encoding Opus]" : ""}`);
   });
   ffargs.push(outputPath);
   jobLog(`[opus] ffmpeg ${ffargs.map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ")}`);
