@@ -326,11 +326,26 @@ var require_encoderFlags = __commonJS({
     };
     var formatSvtForAv1an = ({ entries, hdrSvt }) => entries.map(([k, v]) => `--${k} ${v}`).concat(hdrSvt || []).filter(Boolean).join(" ");
     var formatSvtForAbAv1 = ({ entries }) => entries.map(([k, v]) => `--svt ${k}=${v}`).join(" ");
-    var buildSvtFlags = (preset, hdrSvt, extra = "") => [formatSvtForAv1an(svtConfig(preset, hdrSvt)), extra].filter(Boolean).join(" ");
+    // Keys the user overrides via extra params -- drop the base svtConfig entry so the
+    // option is not emitted twice (SVT-AV1 warns "Duplicate option --X" and only applies
+    // the last one). Handles av1an form (--key val / --key=val) and ab-av1 form (--svt key=val).
+    var extractSvtKeys = (s) => {
+      const keys = /* @__PURE__ */ new Set();
+      if (!s) return keys;
+      for (const m of s.matchAll(/--svt\s+([a-z0-9][a-z0-9-]*)\s*=/gi)) keys.add(m[1]);
+      for (const m of s.matchAll(/--([a-z0-9][a-z0-9-]*)(?:\s+[^-\s]|=)/gi)) if (m[1] !== "svt") keys.add(m[1]);
+      return keys;
+    };
+    var dropOverridden = (cfg, extra) => {
+      const ov = extractSvtKeys(extra);
+      return { entries: cfg.entries.filter(([k]) => !ov.has(k)), hdrSvt: cfg.hdrSvt };
+    };
+    var buildSvtFlags = (preset, hdrSvt, extra = "") => [formatSvtForAv1an(dropOverridden(svtConfig(preset, hdrSvt), extra)), extra].filter(Boolean).join(" ");
     var buildAbAv1SvtFlags = (extra = "") => {
       const cfg = svtConfig(0, "");
       const skip = /* @__PURE__ */ new Set(["rc", "preset", "input-depth", "keyint"]);
-      const filtered = { entries: cfg.entries.filter(([k]) => !skip.has(k)), hdrSvt: "" };
+      const ov = extractSvtKeys(extra);
+      const filtered = { entries: cfg.entries.filter(([k]) => !skip.has(k) && !ov.has(k)), hdrSvt: "" };
       return [formatSvtForAbAv1(filtered), "--keyint 10s", "--scd true", extra].filter(Boolean).join(" ");
     };
     var buildAbAv1AomFlags = (preset, hdrAom) => {
