@@ -1028,7 +1028,7 @@ var plugin = async (args) => {
   const customSvtParams = String(inputs.custom_svt_params || "").trim();
   const dvRpuSidecar = inputs.dv_rpu_sidecar === void 0 ? true : inputs.dv_rpu_sidecar === true || inputs.dv_rpu_sidecar === "true";
   const hdr10plusSidecar = inputs.hdr10plus_sidecar === void 0 ? true : inputs.hdr10plus_sidecar === true || inputs.hdr10plus_sidecar === "true";
-  const workers = Number(inputs.workers) || 0;
+  const workersInput = Number(inputs.workers) || 0;
   const filmGrain = Number(inputs.film_grain) || 0;
   const verifyOutput = inputs.verify_output === void 0 ? true : inputs.verify_output === true || inputs.verify_output === "true";
   const findBin = (name, ...paths) => paths.find((p) => fs.existsSync(p)) || (() => {
@@ -1062,6 +1062,19 @@ var plugin = async (args) => {
   const stream = streams.find((s) => s.codec_type === "video") || {};
   const height = stream.height || 0;
   const sourceWidth = stream.width || 0;
+  // Resolution-aware av1an worker cap. 4K SVT-AV1 chunk encoders are very RAM-heavy;
+  // running the full requested worker count on 2160p sources OOM-kills the encoder
+  // on the node (av1an reports "encoder crashed: signal: 9 (SIGKILL)" -> job errors).
+  // Clamp workers down as resolution rises; <=1080p keeps the requested value as-is.
+  // 4K forces a hard cap even when the input is 0 (av1an's auto pick would over-spawn).
+  const resWorkerCap = height >= 1800 ? 1 : height >= 1200 ? 2 : 0;
+  let workers = workersInput;
+  if (resWorkerCap > 0) {
+    workers = workersInput > 0 ? Math.min(workersInput, resWorkerCap) : resWorkerCap;
+    if (workers !== workersInput) {
+      jobLog(`[workers] source is ${height}p -- capping av1an workers ${workersInput || "(default)"} -> ${workers} to avoid encoder OOM`);
+    }
+  }
   const doDownscale = downscaleEnabled && shouldDownscale(sourceWidth, downscaleRes);
   if (downscaleEnabled && !doDownscale) {
     jobLog(`Downscale skipped: source ${sourceWidth}px is already at or below ${downscaleRes} target`);
